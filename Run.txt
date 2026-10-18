@@ -1,0 +1,1 @@
+wsl bash -lc "cd ~/SentinelBPF; ./bin/sentinel-daemon --config config.yaml --mock & cd ~/SentinelBPF/web-ui; npm run dev"

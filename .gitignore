@@ -1,0 +1,22 @@
+# Binaries
+bin/
+*.exe
+*.o
+*.so
+
+# Generated eBPF files
+bpf/vmlinux.h
+internal/bpf/sentinel_bpf*
+
+# Node / Web UI
+web-ui/node_modules/
+web-ui/.next/
+web-ui/out/
+web-ui/.turbo/
+web-ui/.env*.local
+
+# Logs and runtime files
+*.log
+.DS_Store
+Thumbs.db
+.run/

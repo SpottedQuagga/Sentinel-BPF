@@ -17,7 +17,6 @@ export function useWebSocket() {
   const [status, setStatus] = useState<ConnectionStatus>('CONNECTING');
   const [events, setEvents] = useState<KernelEvent[]>([]);
   const [alerts, setAlerts] = useState<SecurityAlert[]>([]);
-  const [isMock, setIsMock] = useState<boolean>(false);
   const [metrics, setMetrics] = useState<SystemMetrics>({
     events_per_sec: 0,
     total_events: 0,
@@ -30,6 +29,7 @@ export function useWebSocket() {
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const backoffRef = useRef<number>(1000); // 1s initial backoff
   const isUnmountedRef = useRef<boolean>(false);
+  const connectionSeqRef = useRef<number>(0);
 
   // Incoming buffers for 10Hz flush
   const eventBufferRef = useRef<KernelEvent[]>([]);
@@ -43,8 +43,19 @@ export function useWebSocket() {
       if (eventBufferRef.current.length > 0) {
         const batch = eventBufferRef.current;
         eventBufferRef.current = [];
+        // Dedupe events within the batch by composite key. Duplicate WebSocket
+        // connections deliver the same server-side event with identical kernel
+        // timestamps, so this safely preserves legitimate repeated events which
+        // always have distinct timestamps.
+        const seenEvents = new Set<string>();
+        const dedupedBatch = batch.filter((e) => {
+          const key = `${e.timestamp_ns}:${e.pid}:${e.event_type}`;
+          if (seenEvents.has(key)) return false;
+          seenEvents.add(key);
+          return true;
+        });
         setEvents((prev) => {
-          const combined = [...prev, ...batch];
+          const combined = [...prev, ...dedupedBatch];
           if (combined.length > MAX_EVENT_HISTORY) {
             return combined.slice(combined.length - MAX_EVENT_HISTORY);
           }
@@ -52,12 +63,20 @@ export function useWebSocket() {
         });
       }
 
-      // 2. Flush Alerts
+      // 2. Flush Alerts — dedupe by unique id to prevent duplicates from
+      // snapshot+live overlap or reconnection scenarios.
       if (alertBufferRef.current.length > 0) {
         const batch = alertBufferRef.current;
         alertBufferRef.current = [];
         setAlerts((prev) => {
-          const combined = [...batch, ...prev];
+          const existingIds = new Set(prev.map((a) => a.id));
+          const newAlerts = batch.filter((a) => {
+            if (existingIds.has(a.id)) return false;
+            existingIds.add(a.id); // also dedupe within batch
+            return true;
+          });
+          if (newAlerts.length === 0) return prev;
+          const combined = [...newAlerts, ...prev];
           if (combined.length > MAX_ALERT_HISTORY) {
             return combined.slice(0, MAX_ALERT_HISTORY);
           }
@@ -79,31 +98,35 @@ export function useWebSocket() {
   const connect = useCallback(() => {
     if (isUnmountedRef.current) return;
 
+    // Prevent duplicate connections (e.g., React Strict Mode double-invoking effects)
+    if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) return;
+
+    const mySeq = ++connectionSeqRef.current;
+
     const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8080/ws';
+    const token = process.env.NEXT_PUBLIC_SENTINEL_TOKEN;
+    let url = wsUrl;
+    if (token) {
+      const separator = url.includes('?') ? '&' : '?';
+      url = `${url}${separator}token=${token}`;
+    }
     setStatus('CONNECTING');
 
     try {
-      const socket = new WebSocket(wsUrl);
+      const socket = new WebSocket(url);
       wsRef.current = socket;
 
       socket.onopen = () => {
         if (isUnmountedRef.current) return;
+        if (mySeq !== connectionSeqRef.current) return; // stale connection
         setStatus('CONNECTED');
         backoffRef.current = 1000; // Reset backoff on success
       };
 
       socket.onmessage = (event) => {
+        if (mySeq !== connectionSeqRef.current) return; // stale connection
         try {
-          const raw = JSON.parse(event.data);
-          if (raw.type === 'hello') {
-            if (raw.mock) setIsMock(true);
-            return;
-          }
-          if ((raw.type === 'snapshot' || raw.type === 'initial_state') && raw.data?.mock) {
-            setIsMock(true);
-          }
-
-          const msg: WSMessage = raw;
+          const msg: WSMessage = JSON.parse(event.data);
           switch (msg.type) {
             case 'event':
               eventBufferRef.current.push(msg.data);
@@ -117,7 +140,6 @@ export function useWebSocket() {
               latestMetricsRef.current = msg.data;
               break;
 
-            case 'snapshot':
             case 'initial_state':
               if (msg.data.alerts && msg.data.alerts.length > 0) {
                 alertBufferRef.current.push(...msg.data.alerts);
@@ -130,6 +152,8 @@ export function useWebSocket() {
       };
 
       socket.onerror = () => {
+        if (wsRef.current !== socket) return;
+        if (mySeq !== connectionSeqRef.current) return; // stale connection
         if (!isUnmountedRef.current) {
           setStatus('ERROR');
         }
@@ -137,6 +161,10 @@ export function useWebSocket() {
 
       socket.onclose = () => {
         if (isUnmountedRef.current) return;
+        // Only act on close if this socket is still the active one.
+        // Prevents stale WS1.onclose from clearing wsRef after WS2 opens.
+        if (wsRef.current !== socket) return;
+        if (mySeq !== connectionSeqRef.current) return; // stale connection
         setStatus('DISCONNECTED');
         wsRef.current = null;
 
@@ -167,6 +195,7 @@ export function useWebSocket() {
       }
       if (wsRef.current) {
         wsRef.current.close();
+        wsRef.current = null;
       }
     };
   }, [connect]);
@@ -184,7 +213,6 @@ export function useWebSocket() {
     events,
     alerts,
     metrics,
-    isMock,
     clearAlerts,
     clearEvents,
   };

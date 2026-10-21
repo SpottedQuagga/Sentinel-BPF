@@ -151,10 +151,10 @@ Default WebSocket URL used by the dashboard: `ws://127.0.0.1:8080/ws`
 
 ```bash
 # Run Go unit tests (requires no privileges)
-go test -race -count=1 ./...
+go test -race -count=1 ./cmd/... ./internal/...
 
 # Run Go static analysis
-go vet ./...
+go vet ./cmd/... ./internal/...
 gofmt -l .    # no output = clean
 
 # Run Frontend linting and tests
@@ -190,3 +190,9 @@ All benchmarks must be measured in controlled Linux environments.
 2. **Syscall TOCTOU**: Syscall entry tracepoints capture arguments in user space before kernel execution. Pointers may be modified by concurrent threads (time-of-check to time-of-use).
 3. **Ring Buffer Overflows**: In extreme bursts, if user space cannot drain the ring buffer fast enough, events are dropped in the kernel. Drops are tracked and reported.
 4. **Root Compromise**: If an attacker gains full root privileges and manipulates kernel memory or disables eBPF subsystems, user-space detection tools can be blinded.
+5. **No `/tmp` Execution Rule**: There is no rule implementation for `/tmp` execution in `internal/rules/` and no corresponding configuration section in `config.yaml`.
+6. **Frontend `npm test` Placeholder**: `web-ui/package.json` defines `"test"` as a dummy `echo`, not a real test framework (e.g. Jest or Vitest).
+7. **Mock Mode Is Synthetic**: Mock mode does not exercise real kernel hooks, so ring-buffer-health tiles and event counts are not real kernel measurements in mock mode.
+8. **Fatal Hook Attachments**: 9 of 10 eBPF hooks are fatal if they fail to attach on the real kernel path; the daemon exits immediately if any syscall tracepoint attachment fails.
+9. **IPv4 Only**: Detection rules handle IPv4 traffic only; IPv6 endpoints are not evaluated.
+10. **Embedded Frontend Config**: `NEXT_PUBLIC_*` values are embedded in the browser bundle at build time, so WebSocket token setup is suitable for local/demo use only, not for production secret management.

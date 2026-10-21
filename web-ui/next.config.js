@@ -4,6 +4,7 @@ const nextConfig = {
   output: 'standalone',
   env: {
     NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8080/ws',
+    NEXT_PUBLIC_SENTINEL_TOKEN: process.env.NEXT_PUBLIC_SENTINEL_TOKEN || '',
   },
 };
 

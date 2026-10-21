@@ -110,7 +110,7 @@ export const MetricsChart: React.FC<MetricsChartProps> = ({ metrics, events }) =
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '10px' }}>
-          {(['EXEC', 'OPENAT', 'CONNECT', 'DUP', 'SETUID', 'PTRACE'] as EventType[]).map((t) => {
+          {(['EXEC', 'OPENAT', 'CONNECT', 'DUP', 'SETUID', 'PTRACE', 'FORK', 'EXIT', 'MOUNT'] as EventType[]).map((t) => {
             const count = distribution[t] || 0;
             const total = Math.max(events.length, 1);
             const pct = Math.min(Math.round((count / total) * 100), 100);

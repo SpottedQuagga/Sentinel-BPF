@@ -14,6 +14,8 @@ web-ui/.next/
 web-ui/out/
 web-ui/.turbo/
 web-ui/.env*.local
+*.tsbuildinfo
+web-ui/tsconfig.tsbuildinfo
 
 # Logs and runtime files
 *.log

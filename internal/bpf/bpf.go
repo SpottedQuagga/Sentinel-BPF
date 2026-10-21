@@ -3,8 +3,8 @@ package bpf
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,14 +68,77 @@ func (m *MockReader) Close() error {
 	return nil
 }
 
-// Start launches a mock event emission loop generating diverse system behaviors.
+// Start launches a mock event emission loop generating diverse system behaviors
+// with realistic multi-level process lineage.
+//
+// Process tree layout:
+//
+//	init(1) → sshd(100) → bash(200) → python3(300) → worker(400..409)
+//	                                 ↘ nc(500)         [reverse shell chain]
+//	                                 ↘ suspicious_app(600) [file tampering]
 func (m *MockReader) Start(ctx context.Context, out chan<- *events.Event) error {
 	go func() {
+		now := time.Now()
+
+		// Seed the root process tree so the process table has
+		// realistic multi-level ancestry from the start.
+		seedProcesses := []*events.Event{
+			{
+				TimestampNs: uint64(now.UnixNano()),
+				EventType:   events.EventExec,
+				TypeName:    "EXEC",
+				Pid:         1, Tid: 1, Ppid: 0,
+				Uid: 0, Gid: 0, Euid: 0, Egid: 0,
+				Comm: "systemd", Pcomm: "", Path: "/usr/lib/systemd/systemd",
+				CgroupID: 1,
+			},
+			{
+				TimestampNs: uint64(now.Add(1 * time.Millisecond).UnixNano()),
+				EventType:   events.EventExec,
+				TypeName:    "EXEC",
+				Pid:         100, Tid: 100, Ppid: 1,
+				Uid: 0, Gid: 0, Euid: 0, Egid: 0,
+				Comm: "sshd", Pcomm: "systemd", Path: "/usr/sbin/sshd",
+				CgroupID: 1,
+			},
+			{
+				TimestampNs: uint64(now.Add(2 * time.Millisecond).UnixNano()),
+				EventType:   events.EventExec,
+				TypeName:    "EXEC",
+				Pid:         200, Tid: 200, Ppid: 100,
+				Uid: 1000, Gid: 1000, Euid: 1000, Egid: 1000,
+				Comm: "bash", Pcomm: "sshd", Path: "/bin/bash",
+				CgroupID: 2,
+			},
+			{
+				TimestampNs: uint64(now.Add(3 * time.Millisecond).UnixNano()),
+				EventType:   events.EventExec,
+				TypeName:    "EXEC",
+				Pid:         300, Tid: 300, Ppid: 200,
+				Uid: 1000, Gid: 1000, Euid: 1000, Egid: 1000,
+				Comm: "python3", Pcomm: "bash", Path: "/usr/bin/python3",
+				CgroupID: 2,
+			},
+		}
+
+		for _, ev := range seedProcesses {
+			select {
+			case out <- ev:
+			case <-ctx.Done():
+				return
+			case <-m.closed:
+				return
+			}
+		}
+
 		ticker := time.NewTicker(350 * time.Millisecond)
 		defer ticker.Stop()
 
-		var seq uint32 = 2000
-		shells := []string{"/bin/bash", "/usr/bin/python3", "/usr/bin/curl", "/bin/sh"}
+		var seq uint32 = 0
+		// Bounded set of worker PIDs: 400..409 (10 workers max)
+		const workerBase uint32 = 400
+		const workerCount uint32 = 10
+		workerBins := []string{"/usr/bin/curl", "/usr/bin/grep", "/usr/bin/awk", "/bin/cat"}
 
 		for {
 			select {
@@ -83,87 +146,172 @@ func (m *MockReader) Start(ctx context.Context, out chan<- *events.Event) error 
 				return
 			case <-m.closed:
 				return
-			case now := <-ticker.C:
+			case ts := <-ticker.C:
 				seq++
-				pid := 2000 + (seq % 100)
-				sh := shells[rand.Intn(len(shells))]
+				tsNs := uint64(ts.UnixNano())
 
-				// Normal execution event
-				ev := &events.Event{
-					TimestampNs: uint64(now.UnixNano()),
-					CgroupID:    uint64(rand.Intn(4) + 1),
-					EventType:   events.EventExec,
-					TypeName:    "EXEC",
-					Pid:         pid,
-					Tid:         pid,
-					Ppid:        1000,
-					Uid:         1000,
-					Gid:         1000,
-					Euid:        1000,
-					Egid:        1000,
-					Comm:        "worker",
-					Pcomm:       "systemd",
-					Path:        sh,
-					Extra:       "-c",
+				// Determine the current worker PID (rotating)
+				workerPid := workerBase + (seq % workerCount)
+				workerBin := workerBins[seq%uint32(len(workerBins))]
+				workerComm := filepath.Base(workerBin)
+
+				// Exit the previous occupant of this PID slot (if any after first cycle)
+				if seq > workerCount {
+					select {
+					case out <- &events.Event{
+						TimestampNs: tsNs,
+						EventType:   events.EventExit,
+						TypeName:    "EXIT",
+						Pid:         workerPid,
+						Ppid:        300,
+						Comm:        workerComm,
+						CgroupID:    2,
+					}:
+					default:
+						atomic.AddUint64(&m.drops, 1)
+					}
 				}
 
-				// Periodically simulate an attack chain (Reverse shell simulation)
+				// Fork a new worker as a child of python3(300)
+				forkEv := &events.Event{
+					TimestampNs: tsNs + 1,
+					EventType:   events.EventFork,
+					TypeName:    "FORK",
+					Pid:         300,
+					Ppid:        200,
+					NewFd:       workerPid, // child PID carried in NewFd
+					Uid:         1000, Gid: 1000, Euid: 1000, Egid: 1000,
+					Comm:    "python3",
+					Pcomm:   "bash",
+					Path:    "/usr/bin/python3",
+					CgroupID: 2,
+				}
+				select {
+				case out <- forkEv:
+				default:
+					atomic.AddUint64(&m.drops, 1)
+				}
+
+				// Exec the worker binary in the child
+				execEv := &events.Event{
+					TimestampNs: tsNs + 2,
+					EventType:   events.EventExec,
+					TypeName:    "EXEC",
+					Pid:         workerPid,
+					Tid:         workerPid,
+					Ppid:        300,
+					Uid:         1000, Gid: 1000, Euid: 1000, Egid: 1000,
+					Comm:    workerComm,
+					Pcomm:   "python3",
+					Path:    workerBin,
+					Extra:   "--help",
+					CgroupID: 2,
+				}
+				select {
+				case out <- execEv:
+				default:
+					atomic.AddUint64(&m.drops, 1)
+				}
+
+				// Periodically simulate reverse shell attack chain:
+				// bash(200) → nc(500): connect → dup stdin → exec /bin/sh
 				if seq%25 == 0 {
-					attackPid := 9900 + (seq % 10)
-					// 1. Connect
+					attackPid := uint32(500)
+					attackTs := uint64(time.Now().UnixNano())
+
+					// Exit the previous occupant of PID 500
 					out <- &events.Event{
-						TimestampNs: uint64(time.Now().UnixNano()),
+						TimestampNs: attackTs,
+						EventType:   events.EventExit,
+						TypeName:    "EXIT",
+						Pid:         attackPid,
+						Ppid:        200,
+						Comm:        "nc",
+						CgroupID:    2,
+					}
+
+					// 1. Connect to external address
+					out <- &events.Event{
+						TimestampNs: attackTs + 1,
 						EventType:   events.EventConnect,
 						TypeName:    "CONNECT",
 						Pid:         attackPid,
-						Ppid:        1000,
+						Ppid:        200,
 						Fd:          4,
 						Daddr:       "198.51.100.42",
 						Dport:       4444,
 						Comm:        "nc",
+						Pcomm:       "bash",
 						Path:        "/bin/nc",
+						CgroupID:    2,
 					}
-					// 2. Dup stdin/stdout
+					// 2. Dup socket fd to stdin
 					out <- &events.Event{
-						TimestampNs: uint64(time.Now().UnixNano()),
+						TimestampNs: attackTs + 2,
 						EventType:   events.EventDup,
 						TypeName:    "DUP",
 						Pid:         attackPid,
-						Ppid:        1000,
+						Ppid:        200,
 						OldFd:       4,
 						NewFd:       0, // stdin
 						Comm:        "nc",
+						Pcomm:       "bash",
+						CgroupID:    2,
 					}
-					// 3. Exec shell
+					// 3. Exec a shell
 					out <- &events.Event{
-						TimestampNs: uint64(time.Now().UnixNano()),
+						TimestampNs: attackTs + 3,
 						EventType:   events.EventExec,
 						TypeName:    "EXEC",
 						Pid:         attackPid,
-						Ppid:        1000,
+						Ppid:        200,
 						Comm:        "sh",
+						Pcomm:       "nc",
 						Path:        "/bin/sh",
+						CgroupID:    2,
 					}
 				}
 
-				// Periodically simulate file tampering
+				// Periodically simulate file tampering:
+				// bash(200) → suspicious_app(600) opens /etc/shadow
 				if seq%40 == 0 {
+					tamperPid := uint32(600)
+					tamperTs := uint64(time.Now().UnixNano())
+
+					// Exit + re-exec to keep PID slot clean
 					out <- &events.Event{
-						TimestampNs: uint64(time.Now().UnixNano()),
+						TimestampNs: tamperTs,
+						EventType:   events.EventExit,
+						TypeName:    "EXIT",
+						Pid:         tamperPid,
+						Ppid:        200,
+						Comm:        "suspicious_app",
+						CgroupID:    2,
+					}
+					out <- &events.Event{
+						TimestampNs: tamperTs + 1,
+						EventType:   events.EventExec,
+						TypeName:    "EXEC",
+						Pid:         tamperPid,
+						Ppid:        200,
+						Uid:         1000, Gid: 1000, Euid: 1000, Egid: 1000,
+						Comm:    "suspicious_app",
+						Pcomm:   "bash",
+						Path:    "/tmp/suspicious_app",
+						CgroupID: 2,
+					}
+					out <- &events.Event{
+						TimestampNs: tamperTs + 2,
 						EventType:   events.EventOpenAt,
 						TypeName:    "OPENAT",
-						Pid:         pid,
-						Ppid:        1000,
-						Flags:       2, // O_RDWR
-						Path:        "/etc/shadow",
-						Comm:        "suspicious_app",
+						Pid:         tamperPid,
+						Ppid:        200,
+						Uid:         1000, Gid: 1000, Euid: 1000, Egid: 1000,
+						Flags:   2, // O_RDWR
+						Path:    "/etc/shadow",
+						Comm:    "suspicious_app",
+						CgroupID: 2,
 					}
-				}
-
-				select {
-				case out <- ev:
-				default:
-					atomic.AddUint64(&m.drops, 1)
 				}
 			}
 		}

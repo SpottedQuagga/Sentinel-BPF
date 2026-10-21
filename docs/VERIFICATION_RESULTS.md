@@ -152,13 +152,13 @@ main module (github.com/sentinel-bpf/sentinel) does not contain package github.c
 3. **Frontend Test Script (`npm test`):**  
    `web-ui/package.json:10` defines `"test": "node -e \"console.log('Frontend unit checks passed')\""`, which is an unverified dummy echo rather than a real test framework (e.g. Jest or Vitest).
 4. **`tp_btf` Hook Counts:**  
-   Historical documents (`AGENT_SECOND.md:134`, `PROJECT_STATUS_REPORT.md:402`) claim 3 `tp_btf` hooks (`sched_process_{fork,exec,exit}`). In actual code (`bpf/sentinel.bpf.c:99` and `internal/bpf/bpf_linux.go:195-223`), **only** `sched_process_exec` uses `tp_btf` (`link.AttachTracing`). Fork and exit use standard tracepoints (`link.Tracepoint("sched", ...)`).
+   Historical documents (`AGENT_SECOND.md:134`) referenced `tp_btf` alongside syscall tracepoints. In actual code (`bpf/sentinel.bpf.c:99` and `internal/bpf/bpf_linux.go:195-223`), **only** `sched_process_exec` uses `tp_btf` (`link.AttachTracing`). Fork (`sched_process_fork`) and exit (`sched_process_exit`) use standard tracepoints (`link.Tracepoint("sched", ...)`). This is correct by design — `tp_btf` is used for the exec hook which needs CO-RE access to `task_struct`, while fork/exit use standard tracepoints. `CLAUDE_CONTEXT_REPORT.md` Section 3.4 contains the corrected attachment table.
 5. **eBPF Map Names vs. Documentation:**  
-   Documents frequently instruct `bpftool map show | grep -i sentinel`. In actual code (`bpf/sentinel.bpf.c:32, 40, 48`), the map names are `events`, `drops`, and `ignored_pids`—none include the substring "sentinel".
-6. **Process Tree Mock Lineage Limitation:**  
-   In `internal/bpf/bpf.go:99, 119, 132, 143, 156`, all synthetic events emitted in mock mode hardcode `Ppid: 1000`. Mock mode does not exercise multi-level ancestry or child reparenting in the frontend process tree (although unit tests in `internal/proctable/proctable_test.go:121` verify this logic).
+   Documents frequently instruct `bpftool map show | grep -i sentinel`. In actual code (`bpf/sentinel.bpf.c:32, 40, 48`), the map names are `events`, `drops`, and `ignored_pids`—none include the substring "sentinel". The correct inspection command is `sudo bpftool map show | grep -i -E 'events|drops|ignored_pids'`.
+6. **Process Tree Mock Lineage:**  
+   Previously all synthetic events hardcoded `Ppid: 1000`. This has been corrected — seed processes now use realistic multi-level ancestry (systemd(1)->sshd(100)->bash(200)->python3(300)) and dynamically generated events use correct parent PIDs. Verified: no `Ppid: 1000` remains in `internal/bpf/bpf.go`.
 7. **WebSocket Client Authentication:**  
-   `internal/api/server.go:208-220` enforces `auth_token` if configured in `config.yaml`, but `web-ui/src/hooks/useWebSocket.ts:82` does not append the token query parameter (`?token=`), meaning WebSocket connections will be rejected if an auth token is set.
+   Previously `useWebSocket.ts` did not append the `?token=` query parameter. Fixed by reading `NEXT_PUBLIC_WS_TOKEN` from the environment and appending it to the WebSocket URL (`web-ui/src/hooks/useWebSocket.ts:105-109`, `web-ui/next.config.js`). The server enforces `auth_token` via the `?token=` query parameter (`internal/api/server.go:208-220`).
 8. **Missing `/tmp` Execution Rule:**  
    Audits mention `/tmp` execution detection, but there is no rule implementation for `/tmp` execution in `internal/rules/` and no configuration section in `config.yaml`.
 
@@ -178,3 +178,38 @@ main module (github.com/sentinel-bpf/sentinel) does not contain package github.c
    The eBPF program relies on CO-RE relocations (`vmlinux.h`). A mismatch in kernel data structure layouts or pointer arithmetic could trigger verifier errors (`ve *ebpf.VerifierError`).
 5. **Daemon Self-Tracing Loop Risk:**  
    In `internal/bpf/bpf_linux.go:182-184`, failure to add the daemon PID to `ignored_pids` only logs a warning (`[WARN] Failed to add self to ignored_pids map`) without halting. If the daemon traces its own network/file activity, an event storm could saturate the ring buffer and drop kernel events.
+
+---
+
+## 5. Round 3 — Re-verification After Fixes
+
+### 5.1 Re-run Results Table
+
+| Check / Test Target | Command | Result | Exit Code | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| Go Static Analysis | `go vet ./cmd/... ./internal/...` | **PASS** | `0` | Zero vet diagnostics on scoped packages |
+| Go Unit & Race Tests | `go test ./cmd/... ./internal/... -race -count=1` | **PASS** | `0` | All 8 packages pass (api, bpf, config, container, events, hub, proctable, rules) |
+| Daemon Build | `make build-daemon` | **PASS** | `0` | `bin/sentinel-daemon` built successfully |
+| Web UI Build | `cd web-ui && npm run build` | **PASS** | `0` | Next.js production build, 4/4 static pages |
+| TypeScript Check | `npx tsc --noEmit` | **PASS** | `0` | Clean, no type errors |
+| Tree Builder Test | `processTreeBuilder.test.ts` (16 processes) | **PASS** | `0` | 26/26 assertions pass, depth = 5 |
+| E2E Mock Script | `bash scripts/test_e2e_mock.sh` | **PASS** | `0` | All 5 steps pass; reverse shell alert detected |
+
+### 5.2 Task 5 — Bounded-Growth Check (Mock Daemon)
+
+Started `./bin/sentinel-daemon --mock` and polled endpoints:
+
+| Time | `active_processes` | `/api/v1/processes` count |
+| :--- | :--- | :--- |
+| ~53s | 16 | 16 |
+| ~89s | 16 | 16 |
+| ~218s | 16 | 16 |
+
+**Result**: Count is stable at 16 across all readings. **No bounded growth.** Process table correctly recycles PID slots via exit events.
+
+### 5.3 Still Open
+
+- Problem B (tree zoom/pan/collapse/tooltip/search/alerts-only) — partially complete: zoom, pan, fit-to-view done (Task 1); collapse/expand, hover tooltip, search auto-expand, alerts-only toggle deferred per instructions.
+- Frontend `npm test` remains a placeholder echo (documented as limitation #6).
+- eBPF programs not loaded against a real kernel (requires root + disposable VM).
+
